@@ -35,6 +35,33 @@ class MultiInpIdentity(nn.Module):
         return x
 
 
+class NISPHead(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, head_type: str, hidden_dim: int, dropout: float, norm_layer):
+        super().__init__()
+        head_type = head_type.lower()
+        if head_type == 'linear':
+            self.net = nn.Sequential(
+                norm_layer(in_dim),
+                nn.Linear(in_dim, out_dim),
+            )
+        elif head_type == 'mlp':
+            hidden_dim = max(1, int(hidden_dim))
+            layers = [
+                norm_layer(in_dim),
+                nn.Linear(in_dim, hidden_dim),
+                nn.GELU(approximate='tanh'),
+            ]
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            layers.append(nn.Linear(hidden_dim, out_dim))
+            self.net = nn.Sequential(*layers)
+        else:
+            raise ValueError(f'Unsupported nisp_head_type={head_type!r}')
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class TextAttentivePool(nn.Module):
     def __init__(self, Ct5: int, D: int):
         super().__init__()
@@ -101,6 +128,12 @@ class Infinity(nn.Module):
         video_frames=1,
         always_training_scales=20,
         apply_spatial_patchify = 0,
+        enable_nisp=0,
+        nisp_mode='code',
+        nisp_head_type='linear',
+        nisp_head_hidden_dim=256,
+        nisp_head_dropout=0.0,
+        nisp_target_layer=0,
         inference_mode=False,
         **kwargs
     ):
@@ -128,6 +161,14 @@ class Infinity(nn.Module):
         self.train_h_div_w_list = train_h_div_w_list if train_h_div_w_list else h_div_w_templates
         self.video_frames = video_frames
         self.always_training_scales = always_training_scales
+        self.enable_nisp = bool(enable_nisp)
+        self.nisp_mode = str(nisp_mode).lower()
+        if self.enable_nisp and self.nisp_mode not in {'code', 'shallow'}:
+            raise ValueError(f'Unsupported nisp_mode={nisp_mode!r}')
+        self.nisp_head_type = nisp_head_type
+        self.nisp_head_hidden_dim = nisp_head_hidden_dim
+        self.nisp_head_dropout = nisp_head_dropout
+        self.nisp_target_layer = int(nisp_target_layer)
 
         assert add_lvl_embeding_only_first_block in [0,1]
         self.add_lvl_embeding_only_first_block = add_lvl_embeding_only_first_block
@@ -227,6 +268,22 @@ class Infinity(nn.Module):
         norm_layer = partial(FastRMSNorm if rms_norm else nn.LayerNorm, eps=norm_eps)
         self.norm0_ve = norm_layer(self.d_vae) if nm0 else nn.Identity()
         self.word_embed = nn.Linear(self.d_vae, self.C)
+        self.nisp_head = NISPHead(
+            in_dim=self.C,
+            out_dim=self.d_vae,
+            head_type=nisp_head_type,
+            hidden_dim=nisp_head_hidden_dim,
+            dropout=nisp_head_dropout,
+            norm_layer=norm_layer,
+        ) if self.enable_nisp and self.nisp_mode == 'code' else None
+        self.shallow_nitp_head = NISPHead(
+            in_dim=self.C,
+            out_dim=self.C,
+            head_type=nisp_head_type,
+            hidden_dim=nisp_head_hidden_dim,
+            dropout=nisp_head_dropout,
+            norm_layer=norm_layer,
+        ) if self.enable_nisp and self.nisp_mode == 'shallow' else None
         
         # [shared adaptive layernorm mapping network]
         self.shared_ada_lin = nn.Sequential(nn.SiLU(inplace=False), SharedAdaLin(self.D, 6*self.C)) if shared_aln else nn.Identity()
@@ -364,6 +421,88 @@ class Infinity(nn.Module):
         x_BLC = torch.cat(x_BLC_list, dim=1)
         return x_BLC
 
+    def blockwise_var_sdp_attn(self, q, k, v, scale_schedule, need_to_pad=0, scale=None):
+        outs = []
+        prefix_end = 0
+        for patch_t_h_w in scale_schedule:
+            block_len = int(np.array(patch_t_h_w).prod())
+            next_end = prefix_end + block_len
+            q_block = q[:, :, prefix_end:next_end, :]
+            k_prefix = k[:, :, :next_end, :]
+            v_prefix = v[:, :, :next_end, :]
+            outs.append(F.scaled_dot_product_attention(
+                query=q_block.to(v.dtype),
+                key=k_prefix.to(v.dtype),
+                value=v_prefix,
+                dropout_p=0,
+                scale=scale,
+            ))
+            prefix_end = next_end
+        if need_to_pad:
+            q_pad = q[:, :, prefix_end:prefix_end + need_to_pad, :]
+            if q_pad.shape[2] > 0:
+                outs.append(F.scaled_dot_product_attention(
+                    query=q_pad.to(v.dtype),
+                    key=k[:, :, :1, :].to(v.dtype),
+                    value=v[:, :, :1, :],
+                    dropout_p=0,
+                    scale=scale,
+                ))
+        return torch.cat(outs, dim=2)
+
+    def forward_blocks_until_layer(
+        self,
+        x_BLC,
+        target_layer,
+        cond_BD_or_gss,
+        ca_kv,
+        attn_bias_or_two_vector,
+        attn_fn,
+        scale_schedule,
+        rope2d_freqs_grid,
+        need_to_pad=0,
+    ):
+        target_layer = int(target_layer)
+        if target_layer < 0 or target_layer > self.depth:
+            raise ValueError(f'nisp_target_layer must be in [0, {self.depth}], got {target_layer}')
+        if target_layer == 0:
+            return x_BLC
+
+        if self.num_block_chunks == 1:
+            h = x_BLC
+            for i, b in enumerate(self.blocks[:target_layer]):
+                if self.add_lvl_embeding_only_first_block and i == 0:
+                    h = self.add_lvl_embeding_for_x_BLC(h, scale_schedule, need_to_pad)
+                if not self.add_lvl_embeding_only_first_block:
+                    h = self.add_lvl_embeding_for_x_BLC(h, scale_schedule, need_to_pad)
+                h = b(x=h, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_bias_or_two_vector, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=rope2d_freqs_grid)
+            return h
+
+        if target_layer % self.num_blocks_in_a_chunk != 0:
+            raise NotImplementedError(
+                f'shallow NITP currently supports chunk-boundary target layers only; '
+                f'got nisp_target_layer={target_layer}, num_blocks_in_a_chunk={self.num_blocks_in_a_chunk}'
+            )
+
+        h = x_BLC
+        chunks_to_run = target_layer // self.num_blocks_in_a_chunk
+        for i, chunk in enumerate(self.block_chunks[:chunks_to_run]):
+            if self.add_lvl_embeding_only_first_block and i == 0:
+                h = self.add_lvl_embeding_for_x_BLC(h, scale_schedule, need_to_pad)
+            if not self.add_lvl_embeding_only_first_block:
+                h = self.add_lvl_embeding_for_x_BLC(h, scale_schedule, need_to_pad)
+            h = chunk(
+                x=h,
+                cond_BD=cond_BD_or_gss,
+                ca_kv=ca_kv,
+                attn_bias_or_two_vector=attn_bias_or_two_vector,
+                attn_fn=attn_fn,
+                scale_schedule=scale_schedule,
+                checkpointing_full_block=False,
+                rope2d_freqs_grid=rope2d_freqs_grid,
+            )
+        return h
+
     def forward(self, label_B_or_BLT: Union[torch.LongTensor, Tuple[torch.FloatTensor, torch.IntTensor, int]], x_BLC_wo_prefix: torch.Tensor, scale_schedule: List[Tuple[int]],
         cfg_infer=False,
         **kwargs,
@@ -374,6 +513,10 @@ class Infinity(nn.Module):
         """
         if cfg_infer:
             return self.autoregressive_infer_cfg(label_B_or_BLT=label_B_or_BLT, scale_schedule=scale_schedule, **kwargs)
+        return_nisp_pred = bool(kwargs.pop('return_nisp_pred', False))
+        return_shallow_nitp = bool(kwargs.pop('return_shallow_nitp', False))
+        shallow_nitp_x_BLC_wo_prefix = kwargs.pop('shallow_nitp_x_BLC_wo_prefix', None)
+        shallow_nitp_target_layer = int(kwargs.pop('shallow_nitp_target_layer', self.nisp_target_layer))
         
         x_BLC_wo_prefix = x_BLC_wo_prefix.float()       # input should be float32
         B = x_BLC_wo_prefix.shape[0]
@@ -396,12 +539,25 @@ class Infinity(nn.Module):
             
             cond_BD_or_gss = self.shared_ada_lin(cond_BD).contiguous()  # gss: gamma, scale, shift; cond_BD_or_gss should be float32
             
-            sos = sos.unsqueeze(1).expand(B, 1, -1) + self.pos_start.expand(B, 1, -1)
-            x_BLC = torch.cat((sos, self.word_embed(self.norm0_ve(x_BLC_wo_prefix))), dim=1)
+            sos_B1C = sos.unsqueeze(1).expand(B, 1, -1) + self.pos_start.expand(B, 1, -1)
+            x_BLC = torch.cat((sos_B1C, self.word_embed(self.norm0_ve(x_BLC_wo_prefix))), dim=1)
 
             # [1.1. pad the seqlen dim]
             l_end = x_BLC.shape[1]
             need_to_pad = (l_end + self.pad_to_multiplier - 1) // self.pad_to_multiplier * self.pad_to_multiplier - l_end # 0
+            shallow_nitp_x_BLC = None
+            if return_shallow_nitp:
+                if self.shallow_nitp_head is None:
+                    raise RuntimeError('return_shallow_nitp=True requires enable_nisp=1 and nisp_mode=shallow when constructing Infinity')
+                if shallow_nitp_x_BLC_wo_prefix is None:
+                    raise RuntimeError('return_shallow_nitp=True requires shallow_nitp_x_BLC_wo_prefix')
+                shallow_nitp_x_BLC_wo_prefix = shallow_nitp_x_BLC_wo_prefix.float()
+                if shallow_nitp_x_BLC_wo_prefix.shape != x_BLC_wo_prefix.shape:
+                    raise RuntimeError(
+                        f'shallow_nitp_x_BLC_wo_prefix shape mismatch: '
+                        f'{shallow_nitp_x_BLC_wo_prefix.shape} != {x_BLC_wo_prefix.shape}'
+                    )
+                shallow_nitp_x_BLC = torch.cat((sos_B1C, self.word_embed(self.norm0_ve(shallow_nitp_x_BLC_wo_prefix))), dim=1)
             
             if self.customized_flash_attn:
                 Infinity_visible_kvlen = self.Infinity_visible_kvlen[:l_end]
@@ -411,6 +567,8 @@ class Infinity(nn.Module):
             elif self.use_flex_attn:
                 if need_to_pad:
                     x_BLC = F.pad(x_BLC, (0, 0, 0, need_to_pad))
+                    if shallow_nitp_x_BLC is not None:
+                        shallow_nitp_x_BLC = F.pad(shallow_nitp_x_BLC, (0, 0, 0, need_to_pad))
                 assert x_BLC.shape[-1] % 128 == 0, 'x_BLC.shape[-1] % 128 != 0'
                 attn_bias_or_two_vector = None
             else:
@@ -422,12 +580,35 @@ class Infinity(nn.Module):
                     attn_bias = F.pad(attn_bias, (0, need_to_pad, 0, need_to_pad), value=-torch.inf)
                     attn_bias[0, 0, l_end:, 0] = 0
                     x_BLC = F.pad(x_BLC, (0, 0, 0, need_to_pad))
+                    if shallow_nitp_x_BLC is not None:
+                        shallow_nitp_x_BLC = F.pad(shallow_nitp_x_BLC, (0, 0, 0, need_to_pad))
                 attn_bias_or_two_vector = attn_bias.type_as(x_BLC).to(x_BLC.device)
         
         if self.use_flex_attn:
             attn_fn = self.attn_fn_compile_dict[tuple(scale_schedule)]
         else:
             attn_fn = None
+
+        shallow_nitp_attn_fn = attn_fn
+        if return_shallow_nitp and self.use_flex_attn:
+            def shallow_nitp_attn_fn(q, k, v, scale=None):
+                return self.blockwise_var_sdp_attn(q, k, v, scale_schedule, need_to_pad=need_to_pad, scale=scale)
+
+        shallow_nitp_target_BLC = None
+        if return_shallow_nitp:
+            with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
+                shallow_nitp_h = self.forward_blocks_until_layer(
+                    shallow_nitp_x_BLC,
+                    shallow_nitp_target_layer,
+                    cond_BD_or_gss,
+                    ca_kv,
+                    attn_bias_or_two_vector,
+                    shallow_nitp_attn_fn,
+                    scale_schedule,
+                    self.rope2d_freqs_grid,
+                    need_to_pad=need_to_pad,
+                )
+                shallow_nitp_target_BLC = shallow_nitp_h[:, :l_end].float().detach()
 
         # [2. block loop]
         SelfAttnBlock.forward, CrossAttnBlock.forward
@@ -451,7 +632,23 @@ class Infinity(nn.Module):
                 x_BLC = chunk(x=x_BLC, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_bias_or_two_vector, attn_fn=attn_fn, scale_schedule=scale_schedule, checkpointing_full_block=checkpointing_full_block, rope2d_freqs_grid=self.rope2d_freqs_grid)
 
         # [3. unpad the seqlen dim, and then get logits]
-        return self.get_logits(x_BLC[:, :l_end], cond_BD)    # return logits BLV, V is vocab_size
+        hidden_BLC = x_BLC[:, :l_end]
+        logits_BLV = self.get_logits(hidden_BLC, cond_BD)    # return logits BLV, V is vocab_size
+        aux = {}
+        if return_nisp_pred:
+            if self.nisp_head is None:
+                raise RuntimeError('return_nisp_pred=True requires enable_nisp=1 and nisp_mode=code when constructing Infinity')
+            with torch.amp.autocast('cuda', enabled=False):
+                nisp_pred = self.nisp_head(hidden_BLC.float())
+            aux['nisp_pred'] = nisp_pred
+        if return_shallow_nitp:
+            with torch.amp.autocast('cuda', enabled=False):
+                shallow_nitp_pred = self.shallow_nitp_head(hidden_BLC.float())
+            aux['shallow_nitp_pred'] = shallow_nitp_pred
+            aux['shallow_nitp_target'] = shallow_nitp_target_BLC
+        if aux:
+            return logits_BLV, aux
+        return logits_BLV
 
     @torch.no_grad()
     def autoregressive_infer_cfg(
